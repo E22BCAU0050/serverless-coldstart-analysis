@@ -1,0 +1,1077 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cold Start Latency Research Infrastructure for AWS Lambda.
+  Deploys a production-like Book Inventory API with multiple Lambda configurations
+  (VPC vs non-VPC, ZIP vs Container, Provisioned Concurrency) for cold start research.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: coldstart-research
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048]
+    Description: Memory for Lambda functions (affects cold start)
+
+  EnableProvisionedConcurrency:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable Provisioned Concurrency on one function for comparison
+
+Conditions:
+  IsProvisionedConcurrencyEnabled: !Equals [!Ref EnableProvisionedConcurrency, "true"]
+
+Mappings:
+  LambdaInsightsLayer:
+    us-east-1:
+      Arn: arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38
+    us-east-2:
+      Arn: arn:aws:lambda:us-east-2:580247275435:layer:LambdaInsightsExtension:38
+    us-west-2:
+      Arn: arn:aws:lambda:us-west-2:580247275435:layer:LambdaInsightsExtension:38
+    ap-south-1:
+      Arn: arn:aws:lambda:ap-south-1:580247275435:layer:LambdaInsightsExtension:38
+    eu-west-1:
+      Arn: arn:aws:lambda:eu-west-1:580247275435:layer:LambdaInsightsExtension:38
+
+# ============================================================
+# VPC RESOURCES
+# ============================================================
+Resources:
+
+  ResearchVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ResearchVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ResearchVPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ResearchVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ResearchVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ResearchVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway for VPC Lambda to reach internet (DynamoDB via Gateway Endpoint = free)
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-nat
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ResearchVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # DynamoDB VPC Endpoint — FREE, avoids NAT costs for DynamoDB traffic
+  DynamoDBVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ResearchVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Lambda functions
+      VpcId: !Ref ResearchVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-lambda-sg
+
+# ============================================================
+# DYNAMODB TABLE (Production-like Book Inventory)
+# ============================================================
+
+  BooksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-books
+      BillingMode: PAY_PER_REQUEST  # On-demand — cost effective for research
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: bookId
+          AttributeType: S
+        - AttributeName: genre
+          AttributeType: S
+        - AttributeName: publishedYear
+          AttributeType: N
+      KeySchema:
+        - AttributeName: bookId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: genre-publishedYear-index
+          KeySchema:
+            - AttributeName: genre
+              KeyType: HASH
+            - AttributeName: publishedYear
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false  # Disabled for cost savings in research
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Metrics storage table for research analysis
+  MetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-metrics
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: requestId
+          AttributeType: S
+        - AttributeName: functionType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: requestId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: functionType-index
+          KeySchema:
+            - AttributeName: functionType
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true   # Auto-expire old metrics after 30 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ============================================================
+# IAM ROLE
+# ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt BooksTable.Arn
+                  - !Sub ${BooksTable.Arn}/index/*
+                  - !GetAtt MetricsTable.Arn
+                  - !Sub ${MetricsTable.Arn}/index/*
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+# ============================================================
+# LAMBDA LOG GROUPS (pre-create for retention control)
+# ============================================================
+
+  LogGroupNonVpc:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-api-non-vpc
+      RetentionInDays: 14  # Keep 14 days — cost effective
+
+  LogGroupVpc:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-api-vpc
+      RetentionInDays: 14
+
+  LogGroupProvisioned:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-api-provisioned
+      RetentionInDays: 14
+
+  LogGroupSeeder:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-seeder
+      RetentionInDays: 7
+
+# ============================================================
+# LAMBDA FUNCTIONS
+# ============================================================
+
+  # --- Function 1: Non-VPC (baseline, fastest cold start) ---
+  BookApiNonVpc:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroupNonVpc
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api-non-vpc
+      Description: Book API - Non-VPC deployment (baseline for cold start research)
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 30
+      Layers:
+        - !FindInMap [LambdaInsightsLayer, !Ref "AWS::Region", Arn]
+      Environment:
+        Variables:
+          BOOKS_TABLE: !Ref BooksTable
+          METRICS_TABLE: !Ref MetricsTable
+          FUNCTION_TYPE: non-vpc
+          ENVIRONMENT: !Ref Environment
+          POWERTOOLS_SERVICE_NAME: book-api
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, boto3
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          books_table = dynamodb.Table(os.environ['BOOKS_TABLE'])
+          metrics_table = dynamodb.Table(os.environ['METRICS_TABLE'])
+          FUNCTION_TYPE = os.environ.get('FUNCTION_TYPE', 'unknown')
+
+          COLD_START = True
+          INIT_TIME = time.time()
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super().default(obj)
+
+          def record_metric(request_id, path, method, duration_ms, is_cold):
+              try:
+                  ttl = int(time.time()) + (30 * 86400)
+                  metrics_table.put_item(Item={
+                      'requestId': request_id,
+                      'functionType': FUNCTION_TYPE,
+                      'path': path,
+                      'method': method,
+                      'durationMs': Decimal(str(round(duration_ms, 2))),
+                      'isColdStart': is_cold,
+                      'memorySize': int(os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', 0)),
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'ttl': ttl
+                  })
+              except Exception as e:
+                  print(f"Metric record error: {e}")
+
+          def handler(event, context):
+              global COLD_START
+              start = time.time()
+              is_cold = COLD_START
+              COLD_START = False
+
+              path = event.get('path', '/')
+              method = event.get('httpMethod', 'GET')
+              path_params = event.get('pathParameters') or {}
+              qs = event.get('queryStringParameters') or {}
+              body = {}
+              if event.get('body'):
+                  try: body = json.loads(event['body'])
+                  except: pass
+
+              try:
+                  if path == '/health':
+                      result = {'status': 'healthy', 'function': FUNCTION_TYPE, 'cold_start': is_cold}
+                      status = 200
+
+                  elif path == '/books' and method == 'GET':
+                      genre = qs.get('genre')
+                      if genre:
+                          resp = books_table.query(
+                              IndexName='genre-publishedYear-index',
+                              KeyConditionExpression=boto3.dynamodb.conditions.Key('genre').eq(genre)
+                          )
+                      else:
+                          resp = books_table.scan(Limit=20)
+                      result = {'books': resp['Items'], 'count': len(resp['Items'])}
+                      status = 200
+
+                  elif path == '/books' and method == 'POST':
+                      book_id = str(uuid.uuid4())
+                      item = {**body, 'bookId': book_id, 'createdAt': datetime.now(timezone.utc).isoformat()}
+                      if 'publishedYear' in item:
+                          item['publishedYear'] = int(item['publishedYear'])
+                      books_table.put_item(Item=item)
+                      result = {'bookId': book_id, 'message': 'Book created'}
+                      status = 201
+
+                  elif path.startswith('/books/') and method == 'GET':
+                      book_id = path_params.get('bookId', path.split('/')[-1])
+                      resp = books_table.get_item(Key={'bookId': book_id})
+                      if 'Item' not in resp:
+                          result = {'error': 'Book not found'}; status = 404
+                      else:
+                          result = resp['Item']; status = 200
+
+                  elif path.startswith('/books/') and method == 'PUT':
+                      book_id = path_params.get('bookId', path.split('/')[-1])
+                      updates = {k: v for k, v in body.items() if k != 'bookId'}
+                      if not updates:
+                          result = {'error': 'No fields to update'}; status = 400
+                      else:
+                          expr = 'SET ' + ', '.join(f'#k{i} = :v{i}' for i in range(len(updates)))
+                          names = {f'#k{i}': k for i, k in enumerate(updates)}
+                          vals = {f':v{i}': v for i, v in enumerate(updates.values())}
+                          books_table.update_item(
+                              Key={'bookId': book_id},
+                              UpdateExpression=expr,
+                              ExpressionAttributeNames=names,
+                              ExpressionAttributeValues=vals
+                          )
+                          result = {'message': 'Updated', 'bookId': book_id}; status = 200
+
+                  elif path.startswith('/books/') and method == 'DELETE':
+                      book_id = path_params.get('bookId', path.split('/')[-1])
+                      books_table.delete_item(Key={'bookId': book_id})
+                      result = {'message': 'Deleted'}; status = 200
+
+                  else:
+                      result = {'error': 'Route not found', 'path': path, 'method': method}
+                      status = 404
+
+              except Exception as e:
+                  result = {'error': str(e)}; status = 500
+
+              duration_ms = (time.time() - start) * 1000
+              record_metric(context.aws_request_id, path, method, duration_ms, is_cold)
+
+              return {
+                  'statusCode': status,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Cold-Start': str(is_cold),
+                      'X-Function-Type': FUNCTION_TYPE,
+                      'X-Duration-Ms': str(round(duration_ms, 2))
+                  },
+                  'body': json.dumps(result, cls=DecimalEncoder)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ColdStartType
+          Value: non-vpc
+
+  # --- Function 2: VPC-Enabled (higher cold start due to ENI provisioning) ---
+  BookApiVpc:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroupVpc
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api-vpc
+      Description: Book API - VPC deployment (higher cold start for research comparison)
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 30
+      Layers:
+        - !FindInMap [LambdaInsightsLayer, !Ref "AWS::Region", Arn]
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          BOOKS_TABLE: !Ref BooksTable
+          METRICS_TABLE: !Ref MetricsTable
+          FUNCTION_TYPE: vpc
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, boto3
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          books_table = dynamodb.Table(os.environ['BOOKS_TABLE'])
+          metrics_table = dynamodb.Table(os.environ['METRICS_TABLE'])
+          FUNCTION_TYPE = os.environ.get('FUNCTION_TYPE', 'unknown')
+          COLD_START = True
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super().default(obj)
+
+          def record_metric(request_id, path, method, duration_ms, is_cold):
+              try:
+                  ttl = int(time.time()) + (30 * 86400)
+                  metrics_table.put_item(Item={
+                      'requestId': request_id,
+                      'functionType': FUNCTION_TYPE,
+                      'path': path,
+                      'method': method,
+                      'durationMs': Decimal(str(round(duration_ms, 2))),
+                      'isColdStart': is_cold,
+                      'memorySize': int(os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', 0)),
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'ttl': ttl
+                  })
+              except Exception as e:
+                  print(f"Metric record error: {e}")
+
+          def handler(event, context):
+              global COLD_START
+              start = time.time()
+              is_cold = COLD_START
+              COLD_START = False
+
+              path = event.get('path', '/')
+              method = event.get('httpMethod', 'GET')
+              path_params = event.get('pathParameters') or {}
+              qs = event.get('queryStringParameters') or {}
+              body = {}
+              if event.get('body'):
+                  try: body = json.loads(event['body'])
+                  except: pass
+
+              try:
+                  if path == '/health':
+                      result = {'status': 'healthy', 'function': FUNCTION_TYPE, 'cold_start': is_cold}
+                      status = 200
+                  elif path == '/books' and method == 'GET':
+                      resp = books_table.scan(Limit=20)
+                      result = {'books': resp['Items'], 'count': len(resp['Items'])}
+                      status = 200
+                  elif path == '/books' and method == 'POST':
+                      book_id = str(uuid.uuid4())
+                      item = {**body, 'bookId': book_id, 'createdAt': datetime.now(timezone.utc).isoformat()}
+                      if 'publishedYear' in item: item['publishedYear'] = int(item['publishedYear'])
+                      books_table.put_item(Item=item)
+                      result = {'bookId': book_id, 'message': 'Book created'}; status = 201
+                  elif path.startswith('/books/') and method == 'GET':
+                      book_id = path_params.get('bookId', path.split('/')[-1])
+                      resp = books_table.get_item(Key={'bookId': book_id})
+                      result = resp.get('Item', {'error': 'Not found'})
+                      status = 200 if 'Item' in resp else 404
+                  else:
+                      result = {'error': 'Route not found'}; status = 404
+              except Exception as e:
+                  result = {'error': str(e)}; status = 500
+
+              duration_ms = (time.time() - start) * 1000
+              record_metric(context.aws_request_id, path, method, duration_ms, is_cold)
+
+              return {
+                  'statusCode': status,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Cold-Start': str(is_cold),
+                      'X-Function-Type': FUNCTION_TYPE,
+                      'X-Duration-Ms': str(round(duration_ms, 2))
+                  },
+                  'body': json.dumps(result, cls=DecimalEncoder)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ColdStartType
+          Value: vpc
+
+  # --- Function 3: Provisioned Concurrency (near-zero cold start) ---
+  BookApiProvisioned:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroupProvisioned
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api-provisioned
+      Description: Book API - Provisioned Concurrency (zero cold start control group)
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 30
+      Layers:
+        - !FindInMap [LambdaInsightsLayer, !Ref "AWS::Region", Arn]
+      Environment:
+        Variables:
+          BOOKS_TABLE: !Ref BooksTable
+          METRICS_TABLE: !Ref MetricsTable
+          FUNCTION_TYPE: provisioned
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, boto3
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          books_table = dynamodb.Table(os.environ['BOOKS_TABLE'])
+          metrics_table = dynamodb.Table(os.environ['METRICS_TABLE'])
+          FUNCTION_TYPE = os.environ.get('FUNCTION_TYPE', 'unknown')
+          COLD_START = True
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super().default(obj)
+
+          def record_metric(request_id, path, method, duration_ms, is_cold):
+              try:
+                  ttl = int(time.time()) + (30 * 86400)
+                  metrics_table.put_item(Item={
+                      'requestId': request_id,
+                      'functionType': FUNCTION_TYPE,
+                      'path': path, 'method': method,
+                      'durationMs': Decimal(str(round(duration_ms, 2))),
+                      'isColdStart': is_cold,
+                      'memorySize': int(os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', 0)),
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'ttl': ttl
+                  })
+              except Exception as e:
+                  print(f"Metric record error: {e}")
+
+          def handler(event, context):
+              global COLD_START
+              start = time.time()
+              is_cold = COLD_START
+              COLD_START = False
+
+              path = event.get('path', '/')
+              method = event.get('httpMethod', 'GET')
+              body = {}
+              if event.get('body'):
+                  try: body = json.loads(event['body'])
+                  except: pass
+
+              try:
+                  if path == '/health':
+                      result = {'status': 'healthy', 'function': FUNCTION_TYPE}; status = 200
+                  elif path == '/books' and method == 'GET':
+                      resp = books_table.scan(Limit=20)
+                      result = {'books': resp['Items'], 'count': len(resp['Items'])}; status = 200
+                  elif path == '/books' and method == 'POST':
+                      book_id = str(uuid.uuid4())
+                      item = {**body, 'bookId': book_id, 'createdAt': datetime.now(timezone.utc).isoformat()}
+                      if 'publishedYear' in item: item['publishedYear'] = int(item['publishedYear'])
+                      books_table.put_item(Item=item)
+                      result = {'bookId': book_id}; status = 201
+                  else:
+                      result = {'error': 'Route not found'}; status = 404
+              except Exception as e:
+                  result = {'error': str(e)}; status = 500
+
+              duration_ms = (time.time() - start) * 1000
+              record_metric(context.aws_request_id, path, method, duration_ms, is_cold)
+
+              return {
+                  'statusCode': status,
+                  'headers': {'Content-Type': 'application/json', 'X-Cold-Start': str(is_cold), 'X-Function-Type': FUNCTION_TYPE},
+                  'body': json.dumps(result, cls=DecimalEncoder)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ColdStartType
+          Value: provisioned
+
+  # Lambda version + alias needed for Provisioned Concurrency
+  BookApiProvisionedVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref BookApiProvisioned
+      Description: Version for provisioned concurrency
+
+  BookApiProvisionedAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref BookApiProvisioned
+      FunctionVersion: !GetAtt BookApiProvisionedVersion.Version
+      Name: live
+
+  ProvisionedConcurrencyConfig:
+    Type: AWS::Lambda::ProvisionedConcurrencyConfig
+    Condition: IsProvisionedConcurrencyEnabled
+    Properties:
+      FunctionName: !Ref BookApiProvisioned
+      Qualifier: !GetAtt BookApiProvisionedAlias.Name
+      ProvisionedConcurrentExecutions: 2  # Keep low — cost effective
+
+  # --- DB Seeder Lambda ---
+  DbSeeder:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroupSeeder
+    Properties:
+      FunctionName: !Sub ${ProjectName}-seeder
+      Description: Seeds DynamoDB with dummy book records for realistic API testing
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          BOOKS_TABLE: !Ref BooksTable
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3, random
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          SAMPLE_BOOKS = [
+            {"title": "Clean Code", "author": "Robert C. Martin", "genre": "Technology", "publishedYear": 2008, "isbn": "978-0132350884", "price": 35.99, "stock": 150, "rating": Decimal("4.7")},
+            {"title": "The Pragmatic Programmer", "author": "David Thomas", "genre": "Technology", "publishedYear": 2019, "isbn": "978-0135957059", "price": 49.95, "stock": 200, "rating": Decimal("4.8")},
+            {"title": "Designing Data-Intensive Applications", "author": "Martin Kleppmann", "genre": "Technology", "publishedYear": 2017, "isbn": "978-1449373320", "price": 55.00, "stock": 80, "rating": Decimal("4.9")},
+            {"title": "The Hitchhiker's Guide to the Galaxy", "author": "Douglas Adams", "genre": "Science Fiction", "publishedYear": 1979, "isbn": "978-0345391803", "price": 12.99, "stock": 300, "rating": Decimal("4.6")},
+            {"title": "Dune", "author": "Frank Herbert", "genre": "Science Fiction", "publishedYear": 1965, "isbn": "978-0441013593", "price": 14.99, "stock": 250, "rating": Decimal("4.8")},
+            {"title": "Ender's Game", "author": "Orson Scott Card", "genre": "Science Fiction", "publishedYear": 1985, "isbn": "978-0812550702", "price": 9.99, "stock": 180, "rating": Decimal("4.5")},
+            {"title": "Sapiens", "author": "Yuval Noah Harari", "genre": "Non-Fiction", "publishedYear": 2011, "isbn": "978-0062316097", "price": 18.00, "stock": 400, "rating": Decimal("4.7")},
+            {"title": "Atomic Habits", "author": "James Clear", "genre": "Self-Help", "publishedYear": 2018, "isbn": "978-0735211292", "price": 16.99, "stock": 500, "rating": Decimal("4.8")},
+            {"title": "The Great Gatsby", "author": "F. Scott Fitzgerald", "genre": "Classic", "publishedYear": 1925, "isbn": "978-0743273565", "price": 10.99, "stock": 120, "rating": Decimal("4.3")},
+            {"title": "1984", "author": "George Orwell", "genre": "Classic", "publishedYear": 1949, "isbn": "978-0451524935", "price": 11.99, "stock": 350, "rating": Decimal("4.7")},
+            {"title": "To Kill a Mockingbird", "author": "Harper Lee", "genre": "Classic", "publishedYear": 1960, "isbn": "978-0061935466", "price": 13.99, "stock": 200, "rating": Decimal("4.8")},
+            {"title": "Brave New World", "author": "Aldous Huxley", "genre": "Classic", "publishedYear": 1932, "isbn": "978-0060850524", "price": 10.99, "stock": 160, "rating": Decimal("4.4")},
+            {"title": "The Alchemist", "author": "Paulo Coelho", "genre": "Fiction", "publishedYear": 1988, "isbn": "978-0062315007", "price": 14.99, "stock": 280, "rating": Decimal("4.6")},
+            {"title": "Harry Potter and the Sorcerer's Stone", "author": "J.K. Rowling", "genre": "Fantasy", "publishedYear": 1997, "isbn": "978-0439708180", "price": 12.99, "stock": 600, "rating": Decimal("4.9")},
+            {"title": "The Lord of the Rings", "author": "J.R.R. Tolkien", "genre": "Fantasy", "publishedYear": 1954, "isbn": "978-0618640157", "price": 24.99, "stock": 300, "rating": Decimal("4.9")},
+            {"title": "System Design Interview", "author": "Alex Xu", "genre": "Technology", "publishedYear": 2020, "isbn": "979-8664653403", "price": 35.99, "stock": 150, "rating": Decimal("4.7")},
+            {"title": "Introduction to Algorithms", "author": "Thomas H. Cormen", "genre": "Technology", "publishedYear": 2009, "isbn": "978-0262033848", "price": 89.99, "stock": 90, "rating": Decimal("4.6")},
+            {"title": "Deep Learning", "author": "Ian Goodfellow", "genre": "Technology", "publishedYear": 2016, "isbn": "978-0262035613", "price": 74.99, "stock": 70, "rating": Decimal("4.7")},
+            {"title": "The Psychology of Money", "author": "Morgan Housel", "genre": "Finance", "publishedYear": 2020, "isbn": "978-0857197689", "price": 19.99, "stock": 320, "rating": Decimal("4.8")},
+            {"title": "Rich Dad Poor Dad", "author": "Robert Kiyosaki", "genre": "Finance", "publishedYear": 1997, "isbn": "978-1612680194", "price": 14.99, "stock": 400, "rating": Decimal("4.5")},
+          ]
+
+          def handler(event, context):
+              table = dynamodb.Table(os.environ['BOOKS_TABLE'])
+              action = event.get('action', 'seed')
+
+              if action == 'clear':
+                  scan = table.scan(ProjectionExpression='bookId')
+                  deleted = 0
+                  with table.batch_writer() as batch:
+                      for item in scan['Items']:
+                          batch.delete_item(Key={'bookId': item['bookId']})
+                          deleted += 1
+                  return {'message': f'Cleared {deleted} records'}
+
+              if action == 'seed' or action == 'reseed':
+                  inserted = 0
+                  with table.batch_writer() as batch:
+                      for book in SAMPLE_BOOKS:
+                          item = {
+                              **book,
+                              'bookId': str(uuid.uuid4()),
+                              'createdAt': datetime.now(timezone.utc).isoformat(),
+                              'tags': random.sample(['bestseller', 'award-winner', 'classic', 'recommended', 'new-arrival'], k=2)
+                          }
+                          batch.put_item(Item=item)
+                          inserted += 1
+                  return {'message': f'Seeded {inserted} books', 'status': 'success'}
+
+              return {'error': 'Unknown action. Use: seed, reseed, clear'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ============================================================
+# API GATEWAY
+# ============================================================
+
+  ResearchApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      Description: Book Inventory API for Cold Start Research
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # /health resource
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ParentId: !GetAtt ResearchApi.RootResourceId
+      PathPart: health
+
+  # /books resource
+  BooksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ParentId: !GetAtt ResearchApi.RootResourceId
+      PathPart: books
+
+  # /books/{bookId}
+  BookIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ParentId: !Ref BooksResource
+      PathPart: '{bookId}'
+
+  # --- Methods for Non-VPC ---
+  HealthGetNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  BooksGetNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref BooksResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  BooksPostNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref BooksResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  BookGetNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref BookIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  BookPutNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref BookIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  BookDeleteNonVpc:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResearchApi
+      ResourceId: !Ref BookIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookApiNonVpc.Arn}/invocations
+
+  # Lambda permissions for API Gateway
+  LambdaPermissionNonVpcHealth:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookApiNonVpc
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResearchApi}/*/*
+
+  LambdaPermissionVpc:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookApiVpc
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResearchApi}/*/*
+
+  LambdaPermissionProvisioned:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BookApiProvisioned
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResearchApi}/*/*
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HealthGetNonVpc
+      - BooksGetNonVpc
+      - BooksPostNonVpc
+      - BookGetNonVpc
+      - BookPutNonVpc
+      - BookDeleteNonVpc
+    Properties:
+      RestApiId: !Ref ResearchApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ResearchApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: false  # Disable for cost savings
+          LoggingLevel: ERROR
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ============================================================
+# CLOUDWATCH DASHBOARD
+# ============================================================
+
+  ResearchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-cold-start-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Init Duration (Cold Start) - All Functions",
+                "metrics": [
+                  ["AWS/Lambda", "InitDuration", "FunctionName", "${ProjectName}-api-non-vpc", {"label": "Non-VPC"}],
+                  ["AWS/Lambda", "InitDuration", "FunctionName", "${ProjectName}-api-vpc", {"label": "VPC"}],
+                  ["AWS/Lambda", "InitDuration", "FunctionName", "${ProjectName}-api-provisioned", {"label": "Provisioned"}]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Duration (p99) - All Functions",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-api-non-vpc", {"stat": "p99", "label": "Non-VPC p99"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-api-vpc", {"stat": "p99", "label": "VPC p99"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-api-provisioned", {"stat": "p99", "label": "Provisioned p99"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Invocation Count",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-api-non-vpc"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-api-vpc"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-api-provisioned"]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Error Rate",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-api-non-vpc"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-api-vpc"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-api-provisioned"]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the research API
+    Value: !Sub https://${ResearchApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${ProjectName}-api-url
+
+  NonVpcFunctionArn:
+    Description: ARN of Non-VPC Lambda function
+    Value: !GetAtt BookApiNonVpc.Arn
+
+  VpcFunctionArn:
+    Description: ARN of VPC Lambda function
+    Value: !GetAtt BookApiVpc.Arn
+
+  ProvisionedFunctionArn:
+    Description: ARN of Provisioned Concurrency Lambda function
+    Value: !GetAtt BookApiProvisioned.Arn
+
+  BooksTableName:
+    Description: DynamoDB Books table name
+    Value: !Ref BooksTable
+
+  MetricsTableName:
+    Description: DynamoDB Metrics table name (stores cold start telemetry)
+    Value: !Ref MetricsTable
+
+  SeederFunctionName:
+    Description: Seeder Lambda function name
+    Value: !Ref DbSeeder
+
+  CloudWatchDashboard:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-cold-start-dashboard
