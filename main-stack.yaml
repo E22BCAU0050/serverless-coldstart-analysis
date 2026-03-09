@@ -670,13 +670,8 @@ Resources:
       FunctionName: !Ref BookApiProvisioned
       FunctionVersion: !GetAtt ProvisionedVersion.Version
       Name: live
-
-  ProvisionedConcurrencyConfig:
-    Type: AWS::Lambda::ProvisionedConcurrencyConfig
-    Properties:
-      FunctionName: !Ref BookApiProvisioned
-      Qualifier: !GetAtt ProvisionedAlias.Name
-      ProvisionedConcurrentExecutions: 2
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 2
 
   # ── Seeder Lambda ──
   DbSeeder:
