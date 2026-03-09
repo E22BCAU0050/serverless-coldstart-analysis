@@ -33,7 +33,7 @@ FUNC_PROVISIONED="${PROJECT}-api-provisioned"
 FUNC_SEEDER="${PROJECT}-seeder"
 TABLE_BOOKS="${PROJECT}-books"
 TABLE_METRICS="${PROJECT}-metrics"
-CFN_TEMPLATE="$(dirname "$0")/cloudformation/main-stack.yaml"
+CFN_TEMPLATE="$(dirname "$0")/main-stack.yaml"
 
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -288,7 +288,7 @@ cmd_load() {
   API_URL=$(get_api_url)
   [[ -z "$API_URL" ]] && fail "Could not get API URL. Run deploy first."
 
-  SCRIPT="$(dirname "$0")/load-testing/load-test.js"
+  SCRIPT="$(dirname "$0")/load-test.js"
   [[ -f "$SCRIPT" ]] || fail "k6 script not found: $SCRIPT"
 
   info "Running k6 load test against: $API_URL"
@@ -306,7 +306,7 @@ cmd_extract() {
 
   command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 
-  SCRIPT="$(dirname "$0")/data-pipeline/extract_dataset.py"
+  SCRIPT="$(dirname "$0")/extract_dataset.py"
   [[ -f "$SCRIPT" ]] || fail "Extractor script not found: $SCRIPT"
 
   info "Installing dependencies..."
@@ -332,7 +332,7 @@ cmd_train() {
 
   command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 
-  SCRIPT="$(dirname "$0")/ml-models/train_models.py"
+  SCRIPT="$(dirname "$0")/train_models.py"
   [[ -f "$SCRIPT" ]] || fail "Training script not found: $SCRIPT"
 
   info "Installing ML dependencies..."
