@@ -2,294 +2,322 @@
 """
 Cold Start Dataset Extractor
 ============================
-Pulls cold start metrics from:
-  1. CloudWatch Logs — REPORT lines (InitDuration, Duration, MemoryUsed)
-  2. DynamoDB Metrics Table — application-level telemetry
-  3. CloudWatch Metrics API — Lambda Insights data
+Account : 873166938412
+Region  : us-east-1
+Project : coldstart-research
 
-Outputs a structured CSV ready for ML/DL model training.
+Pulls metrics from:
+  1. DynamoDB  coldstart-research-metrics  (application-level telemetry)
+  2. CloudWatch Logs  REPORT lines         (InitDuration, Duration, MemoryUsed)
+  3. CloudWatch Metrics API                (p95, p99, invocation counts)
+
+Outputs: cold_start_dataset.csv  (ready for ML/DL training)
 
 Usage:
-    pip install boto3 pandas tqdm
-    python extract_dataset.py --region us-east-1 --project coldstart-research --days 7
+  pip install boto3 pandas tqdm
+  python extract_dataset.py [--days 7] [--output cold_start_dataset.csv]
 """
 
+import re
+import sys
+import time
+import json
+import argparse
 import boto3
 import pandas as pd
-import json
-import re
-import time
-import argparse
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from tqdm import tqdm
+from datetime import datetime, timedelta, timezone
 
-# ── Args ──────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+AWS_ACCOUNT  = "873166938412"
+AWS_REGION   = "us-east-1"
+PROJECT      = "coldstart-research"
+
+FUNCTIONS = {
+    "non-vpc":     f"{PROJECT}-api-non-vpc",
+    "vpc":         f"{PROJECT}-api-vpc",
+    "provisioned": f"{PROJECT}-api-provisioned",
+}
+TABLE_METRICS = f"{PROJECT}-metrics"
+TABLE_BOOKS   = f"{PROJECT}-books"
+
 parser = argparse.ArgumentParser(description='Extract cold start dataset')
-parser.add_argument('--region',  default='us-east-1')
-parser.add_argument('--project', default='coldstart-research')
-parser.add_argument('--days',    type=int, default=7)
-parser.add_argument('--output',  default='cold_start_dataset.csv')
+parser.add_argument('--days',   type=int, default=7,                     help='How many days back to query')
+parser.add_argument('--output', default='cold_start_dataset.csv',         help='Output CSV filename')
 args = parser.parse_args()
 
-REGION       = args.region
-PROJECT      = args.project
-DAYS         = args.days
-OUTPUT_FILE  = args.output
+# ── AWS clients ───────────────────────────────────────────────────────────────
+dynamo     = boto3.resource('dynamodb', region_name=AWS_REGION)
+logs       = boto3.client('logs',       region_name=AWS_REGION)
+cw         = boto3.client('cloudwatch', region_name=AWS_REGION)
 
-# Lambda function names
-FUNCTIONS = {
-    'non-vpc':    f'{PROJECT}-api-non-vpc',
-    'vpc':        f'{PROJECT}-api-vpc',
-    'provisioned':f'{PROJECT}-api-provisioned',
-}
+END_TIME   = datetime.now(timezone.utc)
+START_TIME = END_TIME - timedelta(days=args.days)
 
-METRICS_TABLE = f'{PROJECT}-metrics'
-
-logs_client = boto3.client('logs',       region_name=REGION)
-dynamo      = boto3.resource('dynamodb', region_name=REGION)
-cw_client   = boto3.client('cloudwatch', region_name=REGION)
-
-# ─────────────────────────────────────────────────────────────
-# 1. Parse REPORT lines from CloudWatch Logs
-# ─────────────────────────────────────────────────────────────
-
+# ── REPORT line regex ──────────────────────────────────────────────────────────
 REPORT_RE = re.compile(
-    r'REPORT RequestId: (?P<request_id>[\w-]+)\s+'
-    r'Duration: (?P<duration>[\d.]+) ms\s+'
-    r'Billed Duration: (?P<billed_duration>[\d.]+) ms\s+'
-    r'Memory Size: (?P<memory_size>\d+) MB\s+'
-    r'Max Memory Used: (?P<max_memory_used>\d+) MB'
-    r'(?:\s+Init Duration: (?P<init_duration>[\d.]+) ms)?'
+    r'REPORT RequestId:\s*(?P<request_id>[\w-]+)\s+'
+    r'Duration:\s*(?P<duration>[\d.]+) ms\s+'
+    r'Billed Duration:\s*(?P<billed>[\d.]+) ms\s+'
+    r'Memory Size:\s*(?P<memory>\d+) MB\s+'
+    r'Max Memory Used:\s*(?P<max_mem>\d+) MB'
+    r'(?:\s+Init Duration:\s*(?P<init>[\d.]+) ms)?'
 )
 
-def query_logs(log_group: str, start_time: datetime, end_time: datetime) -> list[dict]:
-    """Query CW Logs Insights for REPORT lines."""
+# =============================================================================
+# 1. Pull from DynamoDB metrics table
+# =============================================================================
+def pull_dynamo_metrics():
+    print(f"\n[1/3] Scanning DynamoDB: {TABLE_METRICS} ...")
+    table = dynamo.Table(TABLE_METRICS)
+    items = []
+    kwargs = {}
+    while True:
+        resp = table.scan(**kwargs)
+        items.extend(resp['Items'])
+        sys.stdout.write(f"  fetched {len(items)} records...\r")
+        sys.stdout.flush()
+        if 'LastEvaluatedKey' not in resp:
+            break
+        kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+    print(f"  → {len(items)} records from DynamoDB metrics table")
+    return items
+
+# =============================================================================
+# 2. Pull REPORT lines from CloudWatch Logs Insights
+# =============================================================================
+def query_cw_logs(log_group: str, func_type: str) -> list[dict]:
     query = """
     fields @timestamp, @message
     | filter @message like /REPORT RequestId/
     | sort @timestamp asc
     | limit 10000
     """
-    start_ms = int(start_time.timestamp())
-    end_ms   = int(end_time.timestamp())
+    try:
+        resp = logs.start_query(
+            logGroupName=log_group,
+            startTime=int(START_TIME.timestamp()),
+            endTime=int(END_TIME.timestamp()),
+            queryString=query
+        )
+        qid = resp['queryId']
+        for _ in range(40):
+            time.sleep(3)
+            result = logs.get_query_results(queryId=qid)
+            if result['status'] == 'Complete':
+                return result['results']
+            elif result['status'] in ('Failed', 'Cancelled'):
+                print(f"    ⚠ Query {result['status']}")
+                return []
+        print("    ⚠ Query timed out")
+        return []
+    except logs.exceptions.ResourceNotFoundException:
+        print(f"    ⚠ Log group not found: {log_group}")
+        return []
+    except Exception as e:
+        print(f"    ⚠ Error: {e}")
+        return []
 
-    response = logs_client.start_query(
-        logGroupName=log_group,
-        startTime=start_ms,
-        endTime=end_ms,
-        queryString=query
-    )
-    query_id = response['queryId']
-    print(f"  Started CW Logs query: {query_id}")
-
-    # Poll until complete
-    for _ in range(30):
-        time.sleep(3)
-        result = logs_client.get_query_results(queryId=query_id)
-        if result['status'] == 'Complete':
-            return result['results']
-        elif result['status'] in ['Failed', 'Cancelled']:
-            print(f"  Query {query_id} {result['status']}")
-            return []
-
-    print("  Query timed out")
-    return []
-
-def parse_report_line(message: str, timestamp: str, function_type: str) -> dict | None:
-    m = REPORT_RE.search(message)
+def parse_report(msg: str, ts: str, func_type: str) -> dict | None:
+    m = REPORT_RE.search(msg)
     if not m:
         return None
     d = m.groupdict()
     return {
+        'source':          'cloudwatch_logs',
         'request_id':      d['request_id'],
-        'timestamp':       timestamp,
-        'function_type':   function_type,
+        'timestamp':       ts,
+        'function_type':   func_type,
         'duration_ms':     float(d['duration']),
-        'billed_ms':       float(d['billed_duration']),
-        'memory_size_mb':  int(d['memory_size']),
-        'max_memory_mb':   int(d['max_memory_used']),
-        'init_duration_ms': float(d['init_duration']) if d['init_duration'] else 0.0,
-        'is_cold_start':   d['init_duration'] is not None,
+        'billed_ms':       float(d['billed']),
+        'memory_size_mb':  int(d['memory']),
+        'max_memory_mb':   int(d['max_mem']),
+        'init_duration_ms': float(d['init']) if d['init'] else 0.0,
+        'is_cold_start':   d['init'] is not None,
     }
 
-# ─────────────────────────────────────────────────────────────
-# 2. Pull from DynamoDB Metrics Table
-# ─────────────────────────────────────────────────────────────
+def pull_cw_logs_all() -> list[dict]:
+    print(f"\n[2/3] Querying CloudWatch Logs for REPORT lines ...")
+    records = []
+    for func_type, func_name in FUNCTIONS.items():
+        log_group = f"/aws/lambda/{func_name}"
+        print(f"  Querying {log_group} ...")
+        rows = query_cw_logs(log_group, func_type)
+        parsed = []
+        for row in rows:
+            msg = next((f['value'] for f in row if f['field'] == '@message'), '')
+            ts  = next((f['value'] for f in row if f['field'] == '@timestamp'), '')
+            p = parse_report(msg, ts, func_type)
+            if p:
+                parsed.append(p)
+        print(f"  → {len(parsed)} REPORT lines from {func_type}")
+        records.extend(parsed)
+    return records
 
-def pull_dynamo_metrics() -> list[dict]:
-    table = dynamo.Table(METRICS_TABLE)
-    items = []
-    kwargs = {}
-    while True:
-        resp = table.scan(**kwargs)
-        items.extend(resp['Items'])
-        if 'LastEvaluatedKey' not in resp:
-            break
-        kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
-    return items
-
-# ─────────────────────────────────────────────────────────────
-# 3. Pull Lambda CW Metrics (p95, p99 per function)
-# ─────────────────────────────────────────────────────────────
-
-def pull_cw_metrics(function_name: str, start: datetime, end: datetime) -> dict:
-    def get_stat(metric_name: str, stat: str, extended: bool = False):
+# =============================================================================
+# 3. Pull CloudWatch aggregate metrics per function
+# =============================================================================
+def get_cw_stat(func_name: str, metric: str, stat: str, extended=False) -> float | None:
+    try:
         kwargs = dict(
             Namespace='AWS/Lambda',
-            MetricName=metric_name,
-            Dimensions=[{'Name': 'FunctionName', 'Value': function_name}],
-            StartTime=start,
-            EndTime=end,
+            MetricName=metric,
+            Dimensions=[{'Name': 'FunctionName', 'Value': func_name}],
+            StartTime=START_TIME,
+            EndTime=END_TIME,
             Period=3600,
         )
         if extended:
             kwargs['ExtendedStatistics'] = [stat]
         else:
             kwargs['Statistics'] = [stat]
-        resp = cw_client.get_metric_statistics(**kwargs)
+        resp = cw.get_metric_statistics(**kwargs)
         dp = resp['Datapoints']
         if not dp:
             return None
         vals = [d.get(stat) or d.get('ExtendedStatistics', {}).get(stat) for d in dp]
         vals = [v for v in vals if v is not None]
-        return sum(vals) / len(vals) if vals else None
+        return round(sum(vals) / len(vals), 3) if vals else None
+    except Exception:
+        return None
 
-    return {
-        'cw_avg_duration':    get_stat('Duration', 'Average'),
-        'cw_p95_duration':    get_stat('Duration', 'p95', extended=True),
-        'cw_p99_duration':    get_stat('Duration', 'p99', extended=True),
-        'cw_avg_init':        get_stat('InitDuration', 'Average'),
-        'cw_invocations':     get_stat('Invocations', 'Sum'),
-        'cw_errors':          get_stat('Errors', 'Sum'),
-        'cw_throttles':       get_stat('Throttles', 'Sum'),
-        'cw_concurrent_execs':get_stat('ConcurrentExecutions', 'Maximum'),
-    }
+def pull_cw_metrics_all() -> dict:
+    print(f"\n[3/3] Pulling CloudWatch aggregate metrics per function ...")
+    agg = {}
+    for func_type, func_name in FUNCTIONS.items():
+        print(f"  Pulling CW metrics for {func_name} ...")
+        agg[func_type] = {
+            'cw_avg_duration_ms':      get_cw_stat(func_name, 'Duration',            'Average'),
+            'cw_p95_duration_ms':      get_cw_stat(func_name, 'Duration',            'p95', extended=True),
+            'cw_p99_duration_ms':      get_cw_stat(func_name, 'Duration',            'p99', extended=True),
+            'cw_avg_init_ms':          get_cw_stat(func_name, 'InitDuration',         'Average'),
+            'cw_max_init_ms':          get_cw_stat(func_name, 'InitDuration',         'Maximum'),
+            'cw_total_invocations':    get_cw_stat(func_name, 'Invocations',          'Sum'),
+            'cw_total_errors':         get_cw_stat(func_name, 'Errors',              'Sum'),
+            'cw_total_throttles':      get_cw_stat(func_name, 'Throttles',           'Sum'),
+            'cw_max_concurrent_execs': get_cw_stat(func_name, 'ConcurrentExecutions','Maximum'),
+        }
+        for k, v in agg[func_type].items():
+            print(f"    {k}: {v}")
+    return agg
 
-# ─────────────────────────────────────────────────────────────
+# =============================================================================
 # MAIN
-# ─────────────────────────────────────────────────────────────
-
+# =============================================================================
 def main():
-    end_time   = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=DAYS)
+    print("=" * 60)
+    print("COLD START DATASET EXTRACTOR")
+    print(f"Account : {AWS_ACCOUNT}")
+    print(f"Region  : {AWS_REGION}")
+    print(f"Range   : {START_TIME.date()} → {END_TIME.date()} ({args.days} days)")
+    print(f"Output  : {args.output}")
+    print("=" * 60)
 
-    all_records = []
+    # 1. DynamoDB
+    dynamo_items = pull_dynamo_metrics()
+    dynamo_map   = {item['requestId']: item for item in dynamo_items}
 
-    # ── Step 1: CloudWatch Logs ───────────────────────────────
-    print("\n[1/3] Extracting CloudWatch REPORT lines...")
-    for func_type, func_name in FUNCTIONS.items():
-        log_group = f'/aws/lambda/{func_name}'
-        print(f"  Querying {log_group}...")
-        try:
-            results = query_logs(log_group, start_time, end_time)
-            for row in results:
-                msg = next((f['value'] for f in row if f['field'] == '@message'), '')
-                ts  = next((f['value'] for f in row if f['field'] == '@timestamp'), '')
-                parsed = parse_report_line(msg, ts, func_type)
-                if parsed:
-                    all_records.append(parsed)
-            print(f"    → {len([r for r in all_records if r['function_type'] == func_type])} records")
-        except Exception as e:
-            print(f"    ⚠ Error querying {log_group}: {e}")
+    # 2. CloudWatch Logs
+    cw_records = pull_cw_logs_all()
 
-    # ── Step 2: DynamoDB ──────────────────────────────────────
-    print("\n[2/3] Pulling DynamoDB application metrics...")
-    try:
-        dynamo_items = pull_dynamo_metrics()
-        print(f"  → {len(dynamo_items)} records from DynamoDB metrics table")
+    # 3. Enrich CW records with DynamoDB app data
+    cw_ids = set()
+    enriched = []
+    for rec in cw_records:
+        rid  = rec.get('request_id', '')
+        cw_ids.add(rid)
+        dyn  = dynamo_map.get(rid, {})
+        enriched.append({
+            **rec,
+            'app_duration_ms': float(dyn.get('durationMs', 0) or 0),
+            'app_is_cold':     bool(dyn.get('isColdStart', False)),
+            'api_path':        str(dyn.get('path', '')),
+            'api_method':      str(dyn.get('method', '')),
+        })
 
-        # Enrich CW records with DynamoDB data
-        dynamo_map = {item['requestId']: item for item in dynamo_items}
-        for rec in all_records:
-            dyn = dynamo_map.get(rec.get('request_id'), {})
-            rec['app_duration_ms']  = float(dyn.get('durationMs', 0) or 0)
-            rec['app_is_cold']      = bool(dyn.get('isColdStart', False))
-            rec['api_path']         = dyn.get('path', '')
-            rec['api_method']       = dyn.get('method', '')
+    # 4. Add DynamoDB-only records (not yet in CW logs)
+    for item in dynamo_items:
+        if item['requestId'] not in cw_ids:
+            enriched.append({
+                'source':          'dynamodb',
+                'request_id':      item['requestId'],
+                'timestamp':       str(item.get('timestamp', '')),
+                'function_type':   str(item.get('functionType', 'unknown')),
+                'duration_ms':     float(item.get('durationMs', 0) or 0),
+                'billed_ms':       0,
+                'memory_size_mb':  int(item.get('memoryMB', 128) or 128),
+                'max_memory_mb':   0,
+                'init_duration_ms': 0,
+                'is_cold_start':   bool(item.get('isColdStart', False)),
+                'app_duration_ms': float(item.get('durationMs', 0) or 0),
+                'app_is_cold':     bool(item.get('isColdStart', False)),
+                'api_path':        str(item.get('path', '')),
+                'api_method':      str(item.get('method', '')),
+            })
 
-        # Add standalone DynamoDB records not in CW logs
-        cw_ids = {r['request_id'] for r in all_records}
-        for item in dynamo_items:
-            if item['requestId'] not in cw_ids:
-                all_records.append({
-                    'request_id':       item['requestId'],
-                    'timestamp':        str(item.get('timestamp', '')),
-                    'function_type':    str(item.get('functionType', 'unknown')),
-                    'duration_ms':      float(item.get('durationMs', 0) or 0),
-                    'billed_ms':        0,
-                    'memory_size_mb':   int(item.get('memorySize', 0) or 0),
-                    'max_memory_mb':    0,
-                    'init_duration_ms': 0,
-                    'is_cold_start':    bool(item.get('isColdStart', False)),
-                    'app_duration_ms':  float(item.get('durationMs', 0) or 0),
-                    'app_is_cold':      bool(item.get('isColdStart', False)),
-                    'api_path':         str(item.get('path', '')),
-                    'api_method':       str(item.get('method', '')),
-                })
-    except Exception as e:
-        print(f"  ⚠ DynamoDB error: {e}")
+    if not enriched:
+        print("\n⚠ No records found. Make sure you have invoked the Lambda functions.")
+        print("  Run:  ./run_all.sh test   then wait a few minutes before extracting.")
+        sys.exit(0)
 
-    # ── Step 3: CloudWatch Metrics ────────────────────────────
-    print("\n[3/3] Pulling CloudWatch aggregate metrics per function...")
-    cw_agg = {}
-    for func_type, func_name in FUNCTIONS.items():
-        try:
-            cw_agg[func_type] = pull_cw_metrics(func_name, start_time, end_time)
-        except Exception as e:
-            print(f"  ⚠ CW metrics error for {func_name}: {e}")
-            cw_agg[func_type] = {}
-
-    # Attach CW aggregate stats to each record
-    for rec in all_records:
-        stats = cw_agg.get(rec.get('function_type'), {})
-        rec.update(stats)
-
-    # ── Build DataFrame ───────────────────────────────────────
-    if not all_records:
-        print("\n⚠ No records collected. Make sure you have invoked the Lambda functions first.")
-        return
-
-    df = pd.DataFrame(all_records)
-
-    # Feature engineering
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
-    df['hour_of_day']    = df['timestamp'].dt.hour
-    df['day_of_week']    = df['timestamp'].dt.dayofweek
-    df['vpc_flag']       = (df['function_type'] == 'vpc').astype(int)
+    # 5. Build DataFrame + feature engineering
+    df = pd.DataFrame(enriched)
+    df['timestamp']        = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
+    df['hour_of_day']      = df['timestamp'].dt.hour.fillna(12).astype(int)
+    df['day_of_week']      = df['timestamp'].dt.dayofweek.fillna(0).astype(int)
+    df['vpc_flag']         = (df['function_type'] == 'vpc').astype(int)
     df['provisioned_flag'] = (df['function_type'] == 'provisioned').astype(int)
-    df['container_flag'] = 0  # Set to 1 when container image Lambda is deployed
-    df['cold_start_flag'] = df['is_cold_start'].astype(int)
+    df['container_flag']   = 0   # Update to 1 when container-image Lambda added
+    df['cold_start_flag']  = df['is_cold_start'].astype(int)
+    df['memory_size_mb']   = df['memory_size_mb'].fillna(128).astype(int)
 
-    # Select and order final ML features
-    ml_cols = [
-        'request_id', 'timestamp', 'function_type',
+    # 6. Attach CW aggregate stats
+    cw_agg = pull_cw_metrics_all()
+    for col in ['cw_avg_duration_ms','cw_p95_duration_ms','cw_p99_duration_ms',
+                'cw_avg_init_ms','cw_max_init_ms','cw_total_invocations',
+                'cw_total_errors','cw_max_concurrent_execs']:
+        df[col] = df['function_type'].map(lambda ft: cw_agg.get(ft, {}).get(col))
+
+    # 7. Final column order (ML-ready)
+    COLS = [
+        'request_id', 'timestamp', 'function_type', 'source',
+        # Features
         'memory_size_mb', 'vpc_flag', 'provisioned_flag', 'container_flag',
-        'hour_of_day', 'day_of_week',
-        'init_duration_ms',        # TARGET: cold start latency
-        'duration_ms',             # TARGET: execution latency
-        'billed_ms', 'max_memory_mb',
-        'cold_start_flag',
-        'api_path', 'api_method',
-        'cw_avg_duration', 'cw_p95_duration', 'cw_p99_duration',
-        'cw_avg_init', 'cw_invocations', 'cw_errors', 'cw_concurrent_execs',
+        'hour_of_day', 'day_of_week', 'api_path', 'api_method',
+        # Targets
+        'init_duration_ms', 'duration_ms', 'cold_start_flag',
+        # Auxiliary
+        'billed_ms', 'max_memory_mb', 'app_duration_ms',
+        # CW aggregate
+        'cw_avg_duration_ms', 'cw_p95_duration_ms', 'cw_p99_duration_ms',
+        'cw_avg_init_ms', 'cw_max_init_ms',
+        'cw_total_invocations', 'cw_total_errors', 'cw_max_concurrent_execs',
     ]
-    existing_cols = [c for c in ml_cols if c in df.columns]
-    df = df[existing_cols].drop_duplicates(subset=['request_id'], keep='last')
+    existing = [c for c in COLS if c in df.columns]
+    df = df[existing].drop_duplicates(subset=['request_id'], keep='last')
+    df = df.sort_values('timestamp', ascending=True)
 
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"\n✅ Dataset saved: {OUTPUT_FILE}")
-    print(f"   Total records:   {len(df)}")
-    print(f"   Cold starts:     {df['cold_start_flag'].sum() if 'cold_start_flag' in df.columns else 'N/A'}")
-    print(f"   Functions:")
-    if 'function_type' in df.columns:
-        print(df['function_type'].value_counts().to_string())
-    print(f"\n   Columns: {list(df.columns)}")
-    if 'init_duration_ms' in df.columns:
-        cold_df = df[df['cold_start_flag'] == 1]
-        if len(cold_df) > 0:
-            print(f"\n   Cold Start Stats:")
-            print(cold_df.groupby('function_type')['init_duration_ms'].describe().round(2).to_string())
+    df.to_csv(args.output, index=False)
+
+    # 8. Summary
+    print("\n" + "=" * 60)
+    print("DATASET SUMMARY")
+    print("=" * 60)
+    print(f"  Total records  : {len(df)}")
+    print(f"  Cold starts    : {df['cold_start_flag'].sum()}")
+    print(f"  Warm starts    : {(df['cold_start_flag'] == 0).sum()}")
+    print(f"  Output file    : {args.output}")
+    print(f"  Columns        : {len(df.columns)}")
+    print()
+    print("  Records per function:")
+    print(df['function_type'].value_counts().to_string())
+    cold = df[df['cold_start_flag'] == 1]
+    if len(cold) > 0:
+        print("\n  Cold Start Init Duration (ms):")
+        print(cold.groupby('function_type')['init_duration_ms']
+              .describe()[['count','mean','std','min','50%','95%','max']]
+              .round(2).to_string())
+    print("=" * 60)
 
 if __name__ == '__main__':
     main()

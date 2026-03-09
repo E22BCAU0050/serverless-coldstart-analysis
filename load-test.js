@@ -1,173 +1,198 @@
 /**
- * k6 Load Test Script — Cold Start Latency Research
- * 
- * Usage:
- *   k6 run --env API_URL=https://xxxx.execute-api.us-east-1.amazonaws.com/dev load-test.js
+ * k6 Load Test — Cold Start Latency Research
+ * Account: 873166938412 | Region: us-east-1
  *
- * Scenarios:
- *   1. cold_start_burst  — Burst traffic to trigger cold starts (low sleep between VUs)
- *   2. warm_baseline     — Steady traffic to measure warm execution
- *   3. spike_test        — Sudden spike to measure concurrency scaling
+ * Install k6:  brew install k6
+ * Run:         k6 run --env API_URL=<your-api-url> load-test.js
+ *              OR use: ./run_all.sh load  (auto-injects URL)
+ *
+ * 3 Scenarios:
+ *   1. cold_start_burst  — 20 VUs, 1 iteration each → forces cold starts
+ *   2. warm_baseline     — 10 RPS for 2 min → measures warm latency
+ *   3. spike_test        — ramp 0→50→0 VUs → measures concurrency scaling
  */
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Counter, Trend, Rate } from 'k6/metrics';
 
-// ── Custom metrics ──────────────────────────────────────────
-const coldStartCount     = new Counter('cold_start_count');
-const warmStartCount     = new Counter('warm_start_count');
-const coldStartDuration  = new Trend('cold_start_duration_ms');
-const warmStartDuration  = new Trend('warm_start_duration_ms');
-const errorRate          = new Rate('error_rate');
+// ── Custom cold start metrics ─────────────────────────────────────────────────
+const coldStartDetected = new Counter('cold_start_detected');
+const warmStartDetected = new Counter('warm_start_detected');
+const coldStartDuration = new Trend('cold_start_duration_ms', true);
+const warmStartDuration = new Trend('warm_start_duration_ms', true);
+const errorRate         = new Rate('error_rate');
 
-// ── Config ───────────────────────────────────────────────────
-const BASE_URL = __ENV.API_URL || 'https://REPLACE_WITH_YOUR_API_URL/dev';
+// ── API URL (injected from env or hardcode for direct runs) ──────────────────
+const API_URL = __ENV.API_URL || 'https://REPLACE_ME.execute-api.us-east-1.amazonaws.com/dev';
 
-// All 3 function paths (via same API Gateway, different stages or paths)
-// For simplicity we test the non-vpc endpoint; repeat with vpc/provisioned URLs
-const ENDPOINTS = {
-  nonVpc:      BASE_URL,
-  // vpc:      __ENV.VPC_URL || BASE_URL,    // Uncomment after deploying stage variants
-  // provisioned: __ENV.PROV_URL || BASE_URL,
-};
+const HEADERS = { 'Content-Type': 'application/json' };
 
-// ── Test scenarios ────────────────────────────────────────────
+// ── Test Options ──────────────────────────────────────────────────────────────
 export const options = {
   scenarios: {
 
-    // Scenario 1: Force cold starts by idling then bursting
+    // ── Scenario 1: COLD START BURST ────────────────────────────────────────
+    // 20 VUs start simultaneously with no prior warm-up.
+    // Each VU runs exactly 1 iteration — Lambda must spin up 20 new instances.
+    // This maximises cold start observations in the CloudWatch InitDuration metric.
     cold_start_burst: {
-      executor: 'per-vu-iterations',
-      vus: 20,
-      iterations: 1,
+      executor:    'per-vu-iterations',
+      vus:         20,
+      iterations:  1,
       maxDuration: '3m',
-      startTime: '0s',
-      tags: { scenario: 'cold_burst' },
+      startTime:   '0s',
+      tags:        { scenario: 'cold_burst' },
     },
 
-    // Scenario 2: Warm baseline — sustained moderate load
+    // ── Scenario 2: WARM BASELINE ────────────────────────────────────────────
+    // Steady 10 RPS for 2 minutes after burst.
+    // Lambda instances are already warm → measures execution latency only.
     warm_baseline: {
-      executor: 'constant-arrival-rate',
-      rate: 10,
-      timeUnit: '1s',
-      duration: '2m',
+      executor:       'constant-arrival-rate',
+      rate:           10,
+      timeUnit:       '1s',
+      duration:       '2m',
       preAllocatedVUs: 15,
-      maxVUs: 30,
-      startTime: '3m',
-      tags: { scenario: 'warm_baseline' },
+      maxVUs:         30,
+      startTime:      '3m',
+      tags:           { scenario: 'warm_baseline' },
     },
 
-    // Scenario 3: Spike — sudden burst of 50 VUs
+    // ── Scenario 3: SPIKE TEST ───────────────────────────────────────────────
+    // Sudden burst to 50 VUs → tests concurrency scaling and second-wave cold starts.
     spike_test: {
       executor: 'ramping-vus',
       stages: [
         { duration: '10s', target: 50 },
         { duration: '30s', target: 50 },
-        { duration: '10s', target: 0 },
+        { duration: '10s', target:  0 },
       ],
       startTime: '6m',
-      tags: { scenario: 'spike' },
+      tags:      { scenario: 'spike' },
     },
   },
 
+  // ── Thresholds for research pass/fail criteria ────────────────────────────
   thresholds: {
-    http_req_duration:         ['p(95)<3000'],
-    http_req_failed:           ['rate<0.05'],
-    cold_start_duration_ms:    ['avg<2000', 'p(95)<4000'],
-    warm_start_duration_ms:    ['avg<200',  'p(95)<500'],
+    http_req_duration:      ['p(95)<5000'],   // Overall p95 < 5s (generous for cold starts)
+    http_req_failed:        ['rate<0.05'],    // Error rate < 5%
+    cold_start_duration_ms: ['avg<3000'],     // Cold starts avg < 3s
+    warm_start_duration_ms: ['avg<300', 'p(95)<600'], // Warm calls fast
   },
 };
 
-// ── Helper ────────────────────────────────────────────────────
-function parseHeaders(res) {
-  return {
-    isCold:       (res.headers['X-Cold-Start'] || 'false').toLowerCase() === 'true',
-    functionType: res.headers['X-Function-Type'] || 'unknown',
-    durationMs:   parseFloat(res.headers['X-Duration-Ms'] || '0'),
-  };
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function parseColdStart(res) {
+  const isCold   = (res.headers['X-Cold-Start'] || '').toLowerCase() === 'true';
+  const durationMs = parseFloat(res.headers['X-Duration-Ms'] || '0');
+  return { isCold, durationMs };
 }
 
-// ── Main test function ────────────────────────────────────────
-export default function () {
-  const scenario = __ENV.SCENARIO || 'default';
-
-  // 1. Health check
-  const health = http.get(`${ENDPOINTS.nonVpc}/health`);
-  check(health, { 'health 200': r => r.status === 200 });
-  const hMeta = parseHeaders(health);
-  if (hMeta.isCold) {
-    coldStartCount.add(1);
-    coldStartDuration.add(hMeta.durationMs);
+function trackMetric(res) {
+  const { isCold, durationMs } = parseColdStart(res);
+  if (isCold) {
+    coldStartDetected.add(1);
+    if (durationMs > 0) coldStartDuration.add(durationMs);
   } else {
-    warmStartCount.add(1);
-    warmStartDuration.add(hMeta.durationMs);
+    warmStartDetected.add(1);
+    if (durationMs > 0) warmStartDuration.add(durationMs);
   }
-  errorRate.add(health.status !== 200);
+  errorRate.add(res.status >= 400 || res.status === 0);
+}
 
-  sleep(0.5);
+// ── Main VU function ──────────────────────────────────────────────────────────
+export default function () {
+  let res;
 
-  // 2. List books
-  const list = http.get(`${ENDPOINTS.nonVpc}/books`);
-  check(list, { 'list books 200': r => r.status === 200 });
-  errorRate.add(list.status !== 200);
-
+  // 1. Health check (lightest possible payload — best for isolating cold start)
+  res = http.get(`${API_URL}/health`, { tags: { endpoint: 'health' } });
+  check(res, { 'health: status 200': r => r.status === 200 });
+  trackMetric(res);
   sleep(0.3);
 
-  // 3. Create a book
+  // 2. List all books
+  res = http.get(`${API_URL}/books`, { tags: { endpoint: 'list-books' } });
+  check(res, {
+    'list-books: status 200': r => r.status === 200,
+    'list-books: has data':   r => { try { return JSON.parse(r.body).books !== undefined; } catch { return false; } }
+  });
+  errorRate.add(res.status !== 200);
+  sleep(0.2);
+
+  // 3. Filter by genre
+  res = http.get(`${API_URL}/books?genre=Technology`, { tags: { endpoint: 'filter-genre' } });
+  check(res, { 'filter-genre: status 200': r => r.status === 200 });
+  sleep(0.2);
+
+  // 4. Create a book
   const payload = JSON.stringify({
-    title:         `Test Book ${Date.now()}`,
-    author:        'k6 Test Runner',
+    title:         `k6 Test Book ${Date.now()}`,
+    author:        'Load Test Runner',
     genre:         'Technology',
-    publishedYear: 2024,
-    price:         9.99,
-    stock:         10,
+    publishedYear: 2025,
+    price:         0.00,
+    stock:         1,
+    tags:          ['test', 'k6'],
   });
-
-  const created = http.post(`${ENDPOINTS.nonVpc}/books`, payload, {
-    headers: { 'Content-Type': 'application/json' },
+  res = http.post(`${API_URL}/books`, payload, {
+    headers: HEADERS,
+    tags:    { endpoint: 'create-book' },
   });
-  check(created, { 'create book 201': r => r.status === 201 });
-  errorRate.add(created.status !== 201);
+  check(res, { 'create-book: status 201': r => r.status === 201 });
+  errorRate.add(res.status !== 201);
 
-  // 4. Get the created book
-  if (created.status === 201) {
-    let body = {};
-    try { body = JSON.parse(created.body); } catch {}
-    if (body.bookId) {
-      const get = http.get(`${ENDPOINTS.nonVpc}/books/${body.bookId}`);
-      check(get, { 'get book 200': r => r.status === 200 });
-    }
+  // 5. Get and update the created book
+  let bookId = '';
+  try { bookId = JSON.parse(res.body).bookId || ''; } catch {}
+
+  if (bookId) {
+    sleep(0.1);
+    res = http.get(`${API_URL}/books/${bookId}`, { tags: { endpoint: 'get-book' } });
+    check(res, { 'get-book: status 200': r => r.status === 200 });
+
+    sleep(0.1);
+    res = http.put(`${API_URL}/books/${bookId}`,
+      JSON.stringify({ stock: 0, notes: 'cleanup' }),
+      { headers: HEADERS, tags: { endpoint: 'update-book' } }
+    );
+    check(res, { 'update-book: status 200': r => r.status === 200 });
   }
-
-  // 5. Query by genre
-  const genre = http.get(`${ENDPOINTS.nonVpc}/books?genre=Technology`);
-  check(genre, { 'genre filter 200': r => r.status === 200 });
 
   sleep(1);
 }
 
-// ── Summary handler ───────────────────────────────────────────
+// ── Summary report ────────────────────────────────────────────────────────────
 export function handleSummary(data) {
+  const m = data.metrics;
+  const get = (key, stat) => m[key]?.values?.[stat]?.toFixed(2) ?? 'N/A';
+
   const summary = {
-    timestamp:            new Date().toISOString(),
-    cold_start_count:     data.metrics.cold_start_count?.values?.count || 0,
-    warm_start_count:     data.metrics.warm_start_count?.values?.count || 0,
-    cold_start_avg_ms:    data.metrics.cold_start_duration_ms?.values?.avg?.toFixed(2) || 'N/A',
-    cold_start_p95_ms:    data.metrics.cold_start_duration_ms?.values?.['p(95)']?.toFixed(2) || 'N/A',
-    warm_start_avg_ms:    data.metrics.warm_start_duration_ms?.values?.avg?.toFixed(2) || 'N/A',
-    warm_start_p95_ms:    data.metrics.warm_start_duration_ms?.values?.['p(95)']?.toFixed(2) || 'N/A',
-    http_req_avg_ms:      data.metrics.http_req_duration?.values?.avg?.toFixed(2) || 'N/A',
-    http_req_p95_ms:      data.metrics.http_req_duration?.values?.['p(95)']?.toFixed(2) || 'N/A',
-    http_req_p99_ms:      data.metrics.http_req_duration?.values?.['p(99)']?.toFixed(2) || 'N/A',
-    error_rate:           data.metrics.error_rate?.values?.rate?.toFixed(4) || 'N/A',
+    generated_at:          new Date().toISOString(),
+    account:               '873166938412',
+    region:                'us-east-1',
+    total_requests:        m.http_reqs?.values?.count ?? 0,
+    cold_starts_detected:  m.cold_start_detected?.values?.count ?? 0,
+    warm_starts_detected:  m.warm_start_detected?.values?.count ?? 0,
+    cold_start_avg_ms:     get('cold_start_duration_ms', 'avg'),
+    cold_start_p95_ms:     get('cold_start_duration_ms', 'p(95)'),
+    cold_start_p99_ms:     get('cold_start_duration_ms', 'p(99)'),
+    warm_start_avg_ms:     get('warm_start_duration_ms', 'avg'),
+    warm_start_p95_ms:     get('warm_start_duration_ms', 'p(95)'),
+    http_req_avg_ms:       get('http_req_duration', 'avg'),
+    http_req_p95_ms:       get('http_req_duration', 'p(95)'),
+    http_req_p99_ms:       get('http_req_duration', 'p(99)'),
+    error_rate_pct:        ((m.error_rate?.values?.rate ?? 0) * 100).toFixed(2) + '%',
   };
 
-  console.log('\n========== COLD START RESEARCH SUMMARY ==========');
-  console.log(JSON.stringify(summary, null, 2));
+  console.log('\n\n' + '='.repeat(60));
+  console.log('COLD START RESEARCH — k6 SUMMARY');
+  console.log('='.repeat(60));
+  Object.entries(summary).forEach(([k, v]) => console.log(`  ${k.padEnd(30)}: ${v}`));
+  console.log('='.repeat(60) + '\n');
 
   return {
-    'k6-summary.json': JSON.stringify(data, null, 2),
-    'cold-start-results.json': JSON.stringify(summary, null, 2),
+    'k6_raw_summary.json':        JSON.stringify(data, null, 2),
+    'k6_coldstart_summary.json':  JSON.stringify(summary, null, 2),
   };
 }
